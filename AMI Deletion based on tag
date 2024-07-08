@@ -1,0 +1,64 @@
+import boto3 
+import re  
+import datetime
+
+def lambda_handler(event, context):
+    ec = boto3.client('ec2', region_name='ap-south-1')
+    emailBody='BFDL Prod AMIs & its associated Snapshots deleted based on DeleteOn tag of AMIs.....\n'
+    SlNo = 1
+    amiCount = 0
+    snapshotCount = 0
+    delete_on = datetime.date.today().strftime('%Y-%m-%d')
+    filters = [
+    	{'Name': 'tag-key', 'Values': ['DeleteOn']},
+    	#{'Name': 'tag-value', 'Values': [delete_on]},
+    ]
+    ami_response = ec.describe_images(Owners=["self"], Filters=filters)
+    print(ami_response)
+    if len(ami_response['Images']) > 0 :
+        snapshot_response = ec.describe_snapshots(OwnerIds=["self"])['Snapshots']
+        delete_flag = ""
+        for ami in ami_response['Images']:
+            #print("AMIs %s" % ami['ImageId'])
+            for tag in ami['Tags']:
+                if tag['Key'] == "DeleteOn":
+                    ami_delete_on = tag['Value']
+                    #print("AMI DeleteOn Tag Value:"+str(ami_delete_on))
+                    if delete_on >= ami_delete_on:
+                        delete_flag = "Proceed to Delete"
+                    else:
+                        delete_flag = ""
+            if delete_flag == "Proceed to Delete":
+                print("Deleting AMI {} since its DeleteOn date {} is less than or equal to today!".format(ami['ImageId'],ami_delete_on))
+                #print("Deleting AMIs %s" % ami['ImageId'])
+                deReg = ec.deregister_image(ImageId=ami['ImageId'])
+                amiCount = amiCount+1
+                #print ami['ImageId']
+                snapDelList='['
+                for snapshot in snapshot_response:
+                    if snapshot['Description'].find(ami['ImageId']) > 0:
+                        print("Deleting Snapshot %s" % snapshot['SnapshotId'])
+                        snapDel = ec.delete_snapshot(SnapshotId=snapshot['SnapshotId'])
+                        snapDelList = snapDelList +'::'+ str(snapshot['SnapshotId'])
+                        snapshotCount = snapshotCount+1
+                emailBody = emailBody + str(SlNo)+'\t'+ str(ami['ImageId']) +'\t'+ snapDelList +']\n'
+                SlNo = SlNo+1
+            else:
+                print("Skipping AMI {} since its DeleteOn date {} is greater than today!".format(ami['ImageId'],ami_delete_on))
+        emailBody = emailBody +'---------------------------------------------------------------\n'
+    else:
+        print('No BFDL Prod AMI to delete on today....%s' % len(ami_response['Images']))
+        emailBody = 'No BFDL Prod AMI to delete on today.'
+    AMIDeletedCount = "\nTotal AMIs Deleted: {}\n".format(amiCount)
+    SnapshotDeletedCount = "Total Snapshots Deleted: {}".format(snapshotCount)
+    emailBody = emailBody+AMIDeletedCount+SnapshotDeletedCount
+    print(emailBody)
+    #ec2 = boto3.client('sns', region_name = 'ap-southeast-1')
+    #topic_arn = 'arn:aws:sns:ap-southeast-1:1234567890:Prod-Instances-SNSTopic'
+    #subLine= "Report-nonProd:- AMI & Snapshot Deletion Lambda Status"
+    #print(ec2.publish(Subject= subLine,Message=emailBody, TopicArn = topic_arn))
+    ec2 = boto3.client('sns', region_name='ap-south-1')
+    topic_arn = 'arn:aws:sns:ap-south-1:1234567890:Team'
+    subLine = "Report-BFDL-Prod:- AMI & Snapshot Deletion Lambda Status"
+    response = ec2.publish(Subject=subLine, Message=emailBody, TopicArn=topic_arn)
+    print(response)
