@@ -1,0 +1,99 @@
+import collections
+import datetime
+
+import boto3
+
+
+def lambda_handler(event, context):
+    ec = boto3.client('ec2', region_name='ap-south-1')
+    retention_days = 15
+    ec2_filter = [{'Name': 'tag-value', 'Values': ['AMIDaily']}]
+    ami_list_to_tag = []
+    sl_no = 1
+    mail_repo = 'AMI Backup List.................\n'
+    reservations = ec.describe_instances(Filters=ec2_filter).get('Reservations', [])
+    instances = sum([[i for i in r['Instances']] for r in reservations], [])
+    print("Found %d instances that need backing up" % len(instances))
+    if len(instances) > 0:
+        to_tag = collections.defaultdict(list)
+        for instance in instances:
+            print(instance['InstanceId'])
+            instance_name = ''
+            for tag in instance['Tags']:
+                if tag['Key'] == 'Name':
+                    instance_name = tag.get('Value')
+                    print("\nInstance Name =%s" % instance_name)
+                if tag['Key'] == 'LOB':
+                    lobName = tag.get('Value')
+            if instance_name == '':
+                instance_name = "AMI of " + instance['InstanceId']
+            create_time = datetime.datetime.now()
+            create_fmt = create_fmt = create_time.strftime('%Y-%m-%d--%H-%M-%S')
+            delete_date = datetime.date.today() + datetime.timedelta(days=retention_days)
+            delete_fmt = delete_date.strftime('%Y-%m-%d')
+            create_image_repsponse = ec.create_image(InstanceId=instance['InstanceId'],
+                                                     Name=instance['InstanceId'] + " AMI " + create_fmt,
+                                                     Description="Lambda created AMI of instance " + instance[
+                                                         'InstanceId'] + " AMI " + create_fmt, NoReboot=True,
+                                                     DryRun=False, TagSpecifications=[{
+                    "ResourceType": "image",
+                    "Tags": [
+                        {
+                            'Key': 'Name',
+                            'Value': instance_name
+                        },
+                        {
+                            "Key": "LOB",
+                            "Value": lobName
+                        },
+                        {
+                            'Key': 'DeleteOn',
+                            'Value': delete_fmt
+                        },
+                        {
+                            'Key': 'CreatedByLambdaFun',
+                            'Value': 'AMIbackup-Daily'
+                        }
+                    ]
+                },
+                    {
+                        "ResourceType": "snapshot",
+                        "Tags": [
+                            {
+                                'Key': 'Name',
+                                'Value': instance_name
+                            },
+                            {
+                                "Key": "LOB",
+                                "Value": lobName
+                            },
+                            {
+                                "Key": 'CreatedByLambdaFun',
+                                "Value": 'PROD-DailyAMIBackup'
+                            }
+                        ]
+                    }
+
+                ]
+                                                     )
+            ami_id = str(create_image_repsponse['ImageId'])
+            # ami_list_to_tag.append(ami_id)
+            # delete_date = datetime.date.today() + datetime.timedelta(days=retention_days)
+            # delete_fmt = delete_date.strftime('%Y-%m-%d')
+            # amitemp = ec.create_tags(Resources=[ami_id], Tags=[{'Key': 'DeleteOn', 'Value': delete_fmt},
+            #                                                    {'Key': 'CreatedByLambdaFun',
+            #                                                     'Value': 'AMIbackup-Weekly'},
+            #                                                    {'Key': 'Name', 'Value': instance_name}, ])
+            mail_repo = mail_repo + str(sl_no) + '\t' + instance_name.ljust(22) + '\t' + ami_id + '\n'
+            sl_no = sl_no + 1
+        mail_repo = mail_repo + '*************************************************'
+    else:
+        print("Found %d instances!!....." % len(instances))
+        mail_repo = mail_repo + "NO instances to backing up"
+    # AMI creation finished.
+    print(mail_repo)
+    ec2 = boto3.client('sns', region_name='ap-south-1')
+    topic_arn = 'arn:aws:sns:ap-south-1:1234567890987654:Team'
+    subLine = "Daily Status report for Production AMI"
+    response = ec2.publish(Subject=subLine, Message=mail_repo, TopicArn=topic_arn)
+    print(response)
