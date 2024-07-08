@@ -1,0 +1,140 @@
+import boto3
+from botocore.exceptions import ClientError
+from datetime import datetime, timedelta
+
+# Create a session using the specified profile
+aws_management_console = boto3.session.Session(profile_name="personal_terraform_pratice")
+
+# LOB to email mapping
+lob_to_email = {
+    "insurance": "insurance_team@example.com", #Mentioned SES registry mail ID
+    "market": "market_team@example.com",
+    # Add other LOB to email mappings as needed
+}
+
+def list_asgs(region_name):
+    client = aws_management_console.client('autoscaling', region_name=region_name)
+    response = client.describe_auto_scaling_groups()
+    return response['AutoScalingGroups']
+
+def get_ami_id_from_asg(asg, region_name):
+    ami_id = None
+    ec2_client = aws_management_console.client('ec2', region_name=region_name)
+    
+    if 'LaunchTemplate' in asg:
+        launch_template = asg['LaunchTemplate']
+        lt_id = launch_template['LaunchTemplateId']
+        lt_version = launch_template.get('Version', '$Latest')
+        
+        lt_response = ec2_client.describe_launch_template_versions(
+            LaunchTemplateId=lt_id,
+            Versions=[lt_version]
+        )
+        if lt_response['LaunchTemplateVersions']:
+            ami_id = lt_response['LaunchTemplateVersions'][0]['LaunchTemplateData']['ImageId']
+    elif 'MixedInstancesPolicy' in asg and 'LaunchTemplate' in asg['MixedInstancesPolicy']:
+        launch_template = asg['MixedInstancesPolicy']['LaunchTemplate']['LaunchTemplateSpecification']
+        lt_id = launch_template['LaunchTemplateId']
+        lt_version = launch_template.get('Version', '$Latest')
+        
+        lt_response = ec2_client.describe_launch_template_versions(
+            LaunchTemplateId=lt_id,
+            Versions=[lt_version]
+        )
+        if lt_response['LaunchTemplateVersions']:
+            ami_id = lt_response['LaunchTemplateVersions'][0]['LaunchTemplateData']['ImageId']
+    return ami_id
+
+def check_ami_state(ami_id, region_name):
+    ec2_client = aws_management_console.client('ec2', region_name=region_name)
+    try:
+        response = ec2_client.describe_images(ImageIds=[ami_id])
+        if response['Images']:
+            return response['Images'][0]['State']
+    except ClientError as e:
+        print(f"Error describing AMI {ami_id}: {e}")
+    return None
+
+def send_ses_notification(email, subject, body):
+    ses_client = aws_management_console.client('ses', region_name='ap-south-1')  # Specify your SES region
+    try:
+        response = ses_client.send_email(
+            Source=email,
+            Destination={
+                'ToAddresses': [
+                    email,
+                ],
+            },
+            Message={
+                'Subject': {
+                    'Data': subject,
+                },
+                'Body': {
+                    'Text': {
+                        'Data': body,
+                    },
+                },
+            },
+        )
+        print(f"Email sent! Message ID: {response['MessageId']}")
+    except ClientError as e:
+        print(f"Error sending email: {e.response['Error']['Message']}")
+
+def get_lob_tag(asg):
+    tags = asg.get('Tags', [])
+    for tag in tags:
+        if tag['Key'] == 'LOB':
+            return tag['Value']
+    return None
+
+def get_ami_deletion_date(image_id, region_name):
+    ec2_client = aws_management_console.client('ec2', region_name=region_name)
+    response = ec2_client.describe_images(ImageIds=[image_id])
+    if 'Tags' in response['Images'][0]:
+        for tag in response['Images'][0]['Tags']:
+            if tag['Key'] == 'DeleteOn':
+                delete_on_date = datetime.strptime(tag['Value'], "%Y-%m-%d").date()
+                return delete_on_date
+    return None
+
+def main(region_name):
+    asgs = list_asgs(region_name)
+    current_date = datetime.now().date()
+    
+    for asg in asgs:
+        asg_name = asg['AutoScalingGroupName']
+        ami_id = get_ami_id_from_asg(asg, region_name)
+        lob = get_lob_tag(asg)
+        email = lob_to_email.get(lob, None)
+        
+        if not email:
+            print(f"No email configured for LOB {lob} in ASG {asg_name}")
+            continue
+
+        if ami_id:
+            # Check immediate alert condition
+            ami_state = check_ami_state(ami_id, region_name)
+            if ami_state != 'available':
+                subject = f"AMI Alert for ASG {asg_name}"
+                body = f"The AMI {ami_id} for ASG {asg_name} is not in 'available' state. Current state: {ami_state}"
+                send_ses_notification(email, subject, body)
+                continue  # Skip further processing for this ASG if immediate alert sent
+            
+            # Check scheduled deletion alert condition
+            delete_on_date = get_ami_deletion_date(ami_id, region_name)
+            if delete_on_date:
+                days_until_deletion = (delete_on_date - current_date).days
+                if days_until_deletion < 3:
+                    subject = f"AMI Deletion Alert for ASG {asg_name}"
+                    body = f"The AMI {ami_id} with DeleteOn tag {delete_on_date} is less than 3 days from deletion."
+                    send_ses_notification(email, subject, body)
+                else:
+                    print(f"DeleteOn date for AMI {ami_id} in ASG {asg_name} is more than 3 days away.")
+            else:
+                print(f"No DeleteOn tag found for AMI {ami_id} in ASG {asg_name}")
+        else:
+            print(f"No AMI found for ASG {asg_name}.")
+
+if __name__ == "__main__":
+    region_name = "ap-south-1"  # Specify your AWS region
+    main(region_name)
